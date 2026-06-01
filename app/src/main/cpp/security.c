@@ -1,260 +1,424 @@
 #include <jni.h>
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <dirent.h>
 #include <android/log.h>
-#include <sys/ptrace.h>
 
-#define TAG "GF_SEC"
 
-// ═══════════════════════════════════
-// Anti-debug: detect ptrace
-// ═══════════════════════════════════
+/* ════════════════════════════════════════════════════════
+   BUILD-TIME XOR KEY — O-MVLL зашифрует это дополнительно
+   ════════════════════════════════════════════════════════ */
+#define BK0 0x4A
+#define BK1 0x7F
+#define BK2 0x3C
+#define BK3 0xB1
+#define BK4 0x92
+#define BK5 0xE5
+#define BK6 0x28
+#define BK7 0xD4
 
-static int check_ptrace() {
-    // If ptrace is already attached (debugger), this will fail
-    if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) {
-        return 1; // debugger detected
-    }
-    // Detach
-    ptrace(PTRACE_DETACH, 0, 0, 0);
-    return 0;
+/* Compile-time key lookup — только #define, никаких массивов */
+#define BK(i) ((i)%8==0?BK0:(i)%8==1?BK1:(i)%8==2?BK2:(i)%8==3?BK3:\
+               (i)%8==4?BK4:(i)%8==5?BK5:(i)%8==6?BK6:BK7)
+
+/* Runtime массив для decode() */
+static const uint8_t BUILD_KEY[8] = {BK0,BK1,BK2,BK3,BK4,BK5,BK6,BK7};
+
+/* ════════════════════════════════════════════════════════
+   HARDWARE KEY — генерируется из железа устройства
+   ════════════════════════════════════════════════════════ */
+
+static uint32_t djb2(const char* s, size_t len) {
+    uint32_t h = 5381;
+    for (size_t i = 0; i < len; i++)
+        h = ((h << 5) + h) ^ (uint8_t)s[i];
+    return h;
 }
 
-// ═══════════════════════════════════
-// Anti-debug: check TracerPid in /proc/self/status
-// ═══════════════════════════════════
+static void derive_hw_key(uint8_t out[8]) {
+    char serial[PROP_VALUE_MAX] = {0};
+    char board[PROP_VALUE_MAX]  = {0};
+    char hw[PROP_VALUE_MAX]     = {0};
+    char cpu[PROP_VALUE_MAX]    = {0};
 
-static int check_tracer_pid() {
-    char buf[512];
-    FILE *f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-    while (fgets(buf, sizeof(buf), f)) {
-        if (strstr(buf, "TracerPid:")) {
-            int pid = 0;
-            sscanf(buf, "TracerPid:\t%d", &pid);
-            fclose(f);
-            return pid != 0 ? 1 : 0;
+    __system_property_get("ro.serialno",        serial);
+    __system_property_get("ro.product.board",   board);
+    __system_property_get("ro.boot.hardware",   hw);
+    __system_property_get("ro.hardware",        cpu);
+
+    char buf[PROP_VALUE_MAX * 4];
+    int n = snprintf(buf, sizeof(buf), "%s|%s|%s|%s", serial, board, hw, cpu);
+    if (n <= 0) n = 1;
+
+    uint32_t h0 = djb2(buf, n);
+    uint32_t h1 = djb2(buf + (n / 2), n - (n / 2));
+
+    /* Собираем 8-байтный ключ из двух хэшей */
+    out[0] = (h0 >>  0) & 0xFF;
+    out[1] = (h0 >>  8) & 0xFF;
+    out[2] = (h0 >> 16) & 0xFF;
+    out[3] = (h0 >> 24) & 0xFF;
+    out[4] = (h1 >>  0) & 0xFF;
+    out[5] = (h1 >>  8) & 0xFF;
+    out[6] = (h1 >> 16) & 0xFF;
+    out[7] = (h1 >> 24) & 0xFF;
+
+    /* Подмешиваем BUILD_KEY → итоговый ключ = HW XOR BUILD */
+    for (int i = 0; i < 8; i++)
+        out[i] ^= BUILD_KEY[i];
+
+    memset(buf, 0, sizeof(buf));
+}
+
+/* Кэшируем ключ — вычисляем один раз */
+static uint8_t  g_hw_key[8];
+static int      g_hw_key_ready = 0;
+
+
+static const uint8_t* get_hw_key(void) {
+    if (!g_hw_key_ready) {
+        
+        if (!g_hw_key_ready) {
+            derive_hw_key(g_hw_key);
+            g_hw_key_ready = 1;
         }
+        
     }
-    fclose(f);
-    return 0;
+    return g_hw_key;
 }
 
-// ═══════════════════════════════════
-// Anti-Frida: detect Frida server
-// ═══════════════════════════════════
+/* ════════════════════════════════════════════════════════
+   МАКРОСЫ: шифрование строк compile-time
+   X(byte, idx) = byte XOR BUILD_KEY[idx % 8]
+   ════════════════════════════════════════════════════════ */
+#define X(b, i) ((uint8_t)((b) ^ BK(i)))
 
-static int check_frida() {
-    // Check for frida-server in /proc
-    DIR *dir = opendir("/proc");
-    if (!dir) return 0;
-    struct dirent *entry;
-    char path[256], cmdline[256];
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_DIR) continue;
-        // Check /proc/[pid]/cmdline
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            memset(cmdline, 0, sizeof(cmdline));
-            fread(cmdline, 1, sizeof(cmdline) - 1, f);
-            fclose(f);
-            if (strstr(cmdline, "frida") || strstr(cmdline, "gadget")) {
-                closedir(dir);
-                return 1;
-            }
-        }
-    }
-    closedir(dir);
-
-    // Check for frida default port
-    char line[256];
-    FILE *tcp = fopen("/proc/net/tcp", "r");
-    if (tcp) {
-        while (fgets(line, sizeof(line), tcp)) {
-            // Frida default port 27042 = 0x69A2
-            if (strstr(line, "69A2")) {
-                fclose(tcp);
-                return 1;
-            }
-        }
-        fclose(tcp);
-    }
-
-    // Check for frida libraries
-    if (access("/data/local/tmp/frida-server", F_OK) == 0) return 1;
-    if (access("/data/local/tmp/re.frida.server", F_OK) == 0) return 1;
-
-    return 0;
+/* Расшифровка зашифрованного буфера статическим ключом сборки */
+static void decode(uint8_t* buf, size_t len) {
+    for (size_t i = 0; i < len; i++)
+        buf[i] ^= BUILD_KEY[i % 8];
 }
 
-// ═══════════════════════════════════
-// Anti-Xposed: detect Xposed framework
-// ═══════════════════════════════════
+/* Затереть буфер после использования */
+#define WIPE(buf, len) do { volatile uint8_t* _p = (volatile uint8_t*)(buf); \
+    for(size_t _i = 0; _i < (len); _i++) _p[_i] = 0; } while(0)
 
-static int check_xposed() {
-    // Check for Xposed bridge in loaded libraries
-    char line[512];
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "XposedBridge") || strstr(line, "xposed") ||
-            strstr(line, "EdXposed") || strstr(line, "LSPosed") ||
-            strstr(line, "lspd") || strstr(line, "riru")) {
-            fclose(f);
-            return 1;
-        }
-    }
-    fclose(f);
-    return 0;
-}
+/* ════════════════════════════════════════════════════════
+   ЗАШИФРОВАННЫЕ СТРОКИ (compile-time XOR с BUILD_KEY)
+   Python для генерации:
+     s = "/proc/self/maps"
+     bk = [0x4A,0x7F,0x3C,0xB1,0x92,0xE5,0x28,0xD4]
+     print([hex(c ^ bk[i%8]) for i,c in enumerate(s.encode())])
+   ════════════════════════════════════════════════════════ */
 
-// ═══════════════════════════════════
-// Anti-emulator: basic emulator detection
-// ═══════════════════════════════════
-
-static int check_emulator() {
-    // Check for common emulator files
-    const char *emu_files[] = {
-        "/dev/socket/qemud",
-        "/dev/qemu_pipe",
-        "/system/lib/libc_malloc_debug_qemu.so",
-        "/sys/qemu_trace",
-        "/system/bin/qemu-props",
-        NULL
-    };
-    for (int i = 0; emu_files[i]; i++) {
-        if (access(emu_files[i], F_OK) == 0) return 1;
-    }
-    return 0;
-}
-
-// ═══════════════════════════════════
-// Signature verification
-// ═══════════════════════════════════
-
-// XOR-encoded expected signature hash (set during build)
-// This makes it harder to find the hash in the binary
-static const unsigned char ENCODED_SIG[] = {
-    // Will be filled with actual hash XOR'd with key
-    // For now: placeholder that always passes
-    0x00
+/* "/proc/self/maps" */
+static const uint8_t ENC_MAPS[] = {
+    X('/',0),X('p',1),X('r',2),X('o',3),X('c',4),X('/',5),
+    X('s',6),X('e',7),X('l',0),X('f',1),X('/',2),X('m',3),
+    X('a',4),X('p',5),X('s',6),0x00
 };
-static const unsigned char XOR_KEY = 0x5A;
 
-JNIEXPORT jboolean JNICALL
-Java_com_glassfiles_security_NativeSecurity_nativeVerifySignature(
-    JNIEnv *env, jclass clz, jbyteArray signatureBytes) {
+/* "frida" */
+static const uint8_t ENC_FRIDA[] = {
+    X('f',0),X('r',1),X('i',2),X('d',3),X('a',4),0x00
+};
 
-    if (!signatureBytes) return JNI_FALSE;
+/* "gum-js-loop" */
+static const uint8_t ENC_GUM[] = {
+    X('g',0),X('u',1),X('m',2),X('-',3),X('j',4),X('s',5),
+    X('-',6),X('l',7),X('o',0),X('o',1),X('p',2),0x00
+};
 
-    jsize len = (*env)->GetArrayLength(env, signatureBytes);
-    if (len <= 0) return JNI_FALSE;
+/* "linjector" */
+static const uint8_t ENC_LINJ[] = {
+    X('l',0),X('i',1),X('n',2),X('j',3),X('e',4),X('c',5),
+    X('t',6),X('o',7),X('r',0),0x00
+};
 
-    // Get signature bytes
-    jbyte *sig = (*env)->GetByteArrayElements(env, signatureBytes, NULL);
-    if (!sig) return JNI_FALSE;
+/* "frida-agent" */
+static const uint8_t ENC_AGENT[] = {
+    X('f',0),X('r',1),X('i',2),X('d',3),X('a',4),X('-',5),
+    X('a',6),X('g',7),X('e',0),X('n',1),X('t',2),0x00
+};
 
-    // Compute simple hash of signature
-    unsigned int hash = 0;
-    for (int i = 0; i < len; i++) {
-        hash = hash * 31 + (unsigned char)sig[i];
-    }
+/* "/system/bin/su" */
+static const uint8_t ENC_SU[] = {
+    X('/',0),X('s',1),X('y',2),X('s',3),X('t',4),X('e',5),
+    X('m',6),X('/',7),X('b',0),X('i',1),X('n',2),X('/',3),
+    X('s',4),X('u',5),0x00
+};
 
-    (*env)->ReleaseByteArrayElements(env, signatureBytes, sig, 0);
+/* "/system/xbin/su" */
+static const uint8_t ENC_XBIN_SU[] = {
+    X('/',0),X('s',1),X('y',2),X('s',3),X('t',4),X('e',5),
+    X('m',6),X('/',7),X('x',0),X('b',1),X('i',2),X('n',3),
+    X('/',4),X('s',5),X('u',6),0x00
+};
 
-    // If ENCODED_SIG is just placeholder (0x00), skip check — first run
-    if (sizeof(ENCODED_SIG) <= 1 && ENCODED_SIG[0] == 0x00) {
-        // Log the hash so developer can embed it later
-        __android_log_print(ANDROID_LOG_INFO, TAG, "SIG_HASH=%u", hash);
-        return JNI_TRUE;
-    }
+/* "/sbin/su" */
+static const uint8_t ENC_SBIN_SU[] = {
+    X('/',0),X('s',1),X('b',2),X('i',3),X('n',4),X('/',5),
+    X('s',6),X('u',7),0x00
+};
 
-    // Decode expected hash
-    unsigned int expected = 0;
-    for (int i = 0; i < sizeof(ENCODED_SIG) && i < 4; i++) {
-        expected |= ((unsigned int)(ENCODED_SIG[i] ^ XOR_KEY)) << (i * 8);
-    }
+/* "/data/local/su" */
+static const uint8_t ENC_LOCAL_SU[] = {
+    X('/',0),X('d',1),X('a',2),X('t',3),X('a',4),X('/',5),
+    X('l',6),X('o',7),X('c',0),X('a',1),X('l',2),X('/',3),
+    X('s',4),X('u',5),0x00
+};
 
-    return (hash == expected) ? JNI_TRUE : JNI_FALSE;
+/* "/sbin/.magisk" */
+static const uint8_t ENC_MAGISK1[] = {
+    X('/',0),X('s',1),X('b',2),X('i',3),X('n',4),X('/',5),
+    X('.',6),X('m',7),X('a',0),X('g',1),X('i',2),X('s',3),
+    X('k',4),0x00
+};
+
+/* "/data/adb/magisk" */
+static const uint8_t ENC_MAGISK2[] = {
+    X('/',0),X('d',1),X('a',2),X('t',3),X('a',4),X('/',5),
+    X('a',6),X('d',7),X('b',0),X('/',1),X('m',2),X('a',3),
+    X('g',4),X('i',5),X('s',6),X('k',7),0x00
+};
+
+/* "/data/adb/ksu" */
+static const uint8_t ENC_KSU[] = {
+    X('/',0),X('d',1),X('a',2),X('t',3),X('a',4),X('/',5),
+    X('a',6),X('d',7),X('b',0),X('/',1),X('k',2),X('s',3),
+    X('u',4),0x00
+};
+
+/* "/data/adb/apatch" */
+static const uint8_t ENC_APATCH[] = {
+    X('/',0),X('d',1),X('a',2),X('t',3),X('a',4),X('/',5),
+    X('a',6),X('d',7),X('b',0),X('/',1),X('a',2),X('p',3),
+    X('a',4),X('t',5),X('c',6),X('h',7),0x00
+};
+
+/* Декодировать строку во временный буфер */
+#define DECODE_STR(enc, tmp) \
+    uint8_t tmp[sizeof(enc)]; \
+    memcpy(tmp, enc, sizeof(enc)); \
+    decode(tmp, sizeof(enc) - 1);
+
+/* ════════════════════════════════════════════════════════
+   FRIDA PORT DETECTION
+   ════════════════════════════════════════════════════════ */
+static int check_port(int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return 0;
+
+    struct timeval tv = {0, 150000};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int r = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    close(sock);
+    return r == 0;
 }
 
-// ═══════════════════════════════════
-// Combined security check
-// ═══════════════════════════════════
+static int detect_frida_ports(void) {
+    /* Порты в виде арифметики — не видны как константы */
+    int base = 27000 + 42;
+    int ports[6];
+    ports[0] = base;
+    ports[1] = base + 1;
+    ports[2] = base + 2;
+    ports[3] = base - 1;
+    ports[4] = base - 2;
+    ports[5] = base - 3;
+    for (int i = 0; i < 6; i++)
+        if (check_port(ports[i])) return 1;
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════
+   /proc/self/maps SCAN
+   ════════════════════════════════════════════════════════ */
+static int detect_frida_maps(void) {
+    DECODE_STR(ENC_MAPS, path_buf);
+    FILE* f = fopen((char*)path_buf, "r");
+    WIPE(path_buf, sizeof(path_buf));
+    if (!f) return 0;
+
+    DECODE_STR(ENC_FRIDA,  s_frida);
+    DECODE_STR(ENC_GUM,    s_gum);
+    DECODE_STR(ENC_LINJ,   s_linj);
+    DECODE_STR(ENC_AGENT,  s_agent);
+
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, (char*)s_frida)  ||
+            strstr(line, (char*)s_gum)    ||
+            strstr(line, (char*)s_linj)   ||
+            strstr(line, (char*)s_agent)) {
+            found = 1; break;
+        }
+    }
+    fclose(f);
+    WIPE(s_frida, sizeof(s_frida));
+    WIPE(s_gum,   sizeof(s_gum));
+    WIPE(s_linj,  sizeof(s_linj));
+    WIPE(s_agent, sizeof(s_agent));
+    return found;
+}
+
+/* ════════════════════════════════════════════════════════
+   ROOT DETECTION
+   ════════════════════════════════════════════════════════ */
+static int detect_root(void) {
+    DECODE_STR(ENC_SU,      su0);
+    DECODE_STR(ENC_XBIN_SU, su1);
+    DECODE_STR(ENC_SBIN_SU, su2);
+    DECODE_STR(ENC_LOCAL_SU,su3);
+
+    const char* paths[4] = {
+        (char*)su0, (char*)su1, (char*)su2, (char*)su3
+    };
+    int found = 0;
+    for (int i = 0; i < 4; i++)
+        if (access(paths[i], F_OK) == 0) { found = 1; break; }
+
+    WIPE(su0, sizeof(su0)); WIPE(su1, sizeof(su1));
+    WIPE(su2, sizeof(su2)); WIPE(su3, sizeof(su3));
+    return found;
+}
+
+/* ════════════════════════════════════════════════════════
+   MAGISK DETECTION
+   ════════════════════════════════════════════════════════ */
+static int detect_magisk(void) {
+    DECODE_STR(ENC_MAGISK1, m0);
+    DECODE_STR(ENC_MAGISK2, m1);
+    DECODE_STR(ENC_KSU,     m2);
+    DECODE_STR(ENC_APATCH,  m3);
+
+    const char* paths[4] = {
+        (char*)m0, (char*)m1, (char*)m2, (char*)m3
+    };
+    int found = 0;
+    for (int i = 0; i < 4; i++)
+        if (access(paths[i], F_OK) == 0) { found = 1; break; }
+
+    WIPE(m0, sizeof(m0)); WIPE(m1, sizeof(m1));
+    WIPE(m2, sizeof(m2)); WIPE(m3, sizeof(m3));
+    return found;
+}
+
+static int run_all_checks(void) {
+    if (detect_frida_ports()) return 1;
+    if (detect_frida_maps())  return 2;
+    if (detect_root())        return 3;
+    if (detect_magisk())      return 4;
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════
+   GITHUB TOKEN ENCRYPTION
+   Шифруем токен hardware key-ом перед сохранением
+   ════════════════════════════════════════════════════════ */
+
+JNIEXPORT jbyteArray JNICALL
+Java_gs_git_vps_security_NativeSecurity_encryptToken(
+        JNIEnv* env, jclass clazz, jstring token) {
+    (void)clazz;
+    const char* t = (*env)->GetStringUTFChars(env, token, NULL);
+    if (!t) return NULL;
+    size_t len = strlen(t);
+
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)len);
+    if (!result) { (*env)->ReleaseStringUTFChars(env, token, t); return NULL; }
+
+    uint8_t* enc = (uint8_t*)malloc(len);
+    if (!enc) { (*env)->ReleaseStringUTFChars(env, token, t); return result; }
+
+    const uint8_t* k = get_hw_key();
+    for (size_t i = 0; i < len; i++)
+        enc[i] = (uint8_t)t[i] ^ k[i % 8];
+
+    (*env)->SetByteArrayRegion(env, result, 0, (jsize)len, (jbyte*)enc);
+    WIPE(enc, len);
+    free(enc);
+    (*env)->ReleaseStringUTFChars(env, token, t);
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_gs_git_vps_security_NativeSecurity_decryptToken(
+        JNIEnv* env, jclass clazz, jbyteArray encrypted) {
+    (void)clazz;
+    jsize len = (*env)->GetArrayLength(env, encrypted);
+    if (len <= 0) return NULL;
+
+    jbyte* raw = (*env)->GetByteArrayElements(env, encrypted, NULL);
+    if (!raw) return NULL;
+
+    uint8_t* dec = (uint8_t*)malloc(len + 1);
+    if (!dec) { (*env)->ReleaseByteArrayElements(env, encrypted, raw, JNI_ABORT); return NULL; }
+
+    const uint8_t* k = get_hw_key();
+    for (jsize i = 0; i < len; i++)
+        dec[i] = (uint8_t)raw[i] ^ k[i % 8];
+    dec[len] = 0;
+
+    jstring result = (*env)->NewStringUTF(env, (char*)dec);
+    WIPE(dec, len + 1);
+    free(dec);
+    (*env)->ReleaseByteArrayElements(env, encrypted, raw, JNI_ABORT);
+    return result;
+}
+
+/* ════════════════════════════════════════════════════════
+   JNI EXPORTS
+   ════════════════════════════════════════════════════════ */
 
 JNIEXPORT jint JNICALL
-Java_com_glassfiles_security_NativeSecurity_nativeSecurityCheck(
-    JNIEnv *env, jclass clz) {
-
-    int threats = 0;
-
-    if (check_tracer_pid()) threats |= 0x01;  // debugger
-    if (check_frida())      threats |= 0x02;  // frida
-    if (check_xposed())     threats |= 0x04;  // xposed/lsposed
-    if (check_emulator())   threats |= 0x08;  // emulator
-
-    return threats;
+Java_gs_git_vps_security_NativeSecurity_runSecurityChecks(
+        JNIEnv* env, jclass clazz) {
+    (void)env; (void)clazz;
+    return run_all_checks();
 }
 
-// ═══════════════════════════════════
-// APK integrity: check classes.dex hash
-// ═══════════════════════════════════
-
 JNIEXPORT jboolean JNICALL
-Java_com_glassfiles_security_NativeSecurity_nativeCheckIntegrity(
-    JNIEnv *env, jclass clz, jstring apkPath) {
-
-    if (!apkPath) return JNI_FALSE;
-
-    const char *path = (*env)->GetStringUTFChars(env, apkPath, NULL);
-    if (!path) return JNI_FALSE;
-
-    // Check that APK file exists and is not suspiciously small
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        (*env)->ReleaseStringUTFChars(env, apkPath, path);
-        return JNI_FALSE;
-    }
-
-    // APK should be at least 1MB (our app is ~110MB)
-    if (st.st_size < 1024 * 1024) {
-        (*env)->ReleaseStringUTFChars(env, apkPath, path);
-        return JNI_FALSE;
-    }
-
-    (*env)->ReleaseStringUTFChars(env, apkPath, path);
-    return JNI_TRUE;
+Java_gs_git_vps_security_NativeSecurity_isFridaDetected(
+        JNIEnv* env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jboolean)(detect_frida_ports() || detect_frida_maps());
 }
 
-// ═══════════════════════════════════
-// Anti-hook: check if key functions are hooked
-// ═══════════════════════════════════
+JNIEXPORT jboolean JNICALL
+Java_gs_git_vps_security_NativeSecurity_isRooted(
+        JNIEnv* env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jboolean)detect_root();
+}
 
 JNIEXPORT jboolean JNICALL
-Java_com_glassfiles_security_NativeSecurity_nativeCheckHooks(
-    JNIEnv *env, jclass clz) {
+Java_gs_git_vps_security_NativeSecurity_isMagiskDetected(
+        JNIEnv* env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jboolean)detect_magisk();
+}
 
-    // Check if system functions look normal
-    void *handle = dlopen("libc.so", RTLD_NOW);
-    if (!handle) return JNI_FALSE;
-
-    // Verify that key libc functions haven't been hooked
-    void *fn_open = dlsym(handle, "open");
-    void *fn_read = dlsym(handle, "read");
-    void *fn_ptrace = dlsym(handle, "ptrace");
-
-    dlclose(handle);
-
-    // If any critical function is NULL, something is wrong
-    if (!fn_open || !fn_read || !fn_ptrace) return JNI_FALSE;
-
-    return JNI_TRUE;
+JNIEXPORT jboolean JNICALL
+Java_gs_git_vps_security_NativeSecurity_isEnvironmentSafe(
+        JNIEnv* env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jboolean)(run_all_checks() == 0);
 }
