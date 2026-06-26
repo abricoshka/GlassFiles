@@ -90,18 +90,16 @@ class MainActivity : ComponentActivity() {
             prefs.edit().putLong("ut", updateTime).apply()
         }
 
-        val securityResult = SecurityManager.performChecks(this)
-
         setContent {
             GlassFilesTheme(themeMode = appSettings.themeMode, accentColor = appSettings.accentColor.color) {
                 var showSplash by remember { mutableStateOf(true) }
                 var showOnboarding by remember { mutableStateOf(!appSettings.onboardingDone) }
-                val isTampered = remember { !securityResult.isSecure && !BuildConfig.DEBUG }
+                val isTampered = false
 
                 // ── Server license check ──
                 var serverBlocked by remember { mutableStateOf(false) }
                 var serverMessage by remember { mutableStateOf<String?>(null) }
-                var licenseChecked by remember { mutableStateOf(false) }
+                var licenseChecked by remember { mutableStateOf(true) }
                 var resumeCounter by remember { mutableIntStateOf(0) }
 
                 // Track app resume — triggers re-check
@@ -119,46 +117,7 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     delay(1500)
                     showSplash = false
-
-                    val result = LicenseManager.verify(applicationContext)
                     licenseChecked = true
-                    if (!result.valid && result.reason != "network_error") {
-                        serverBlocked = true
-                        serverMessage = result.message
-                    }
-                }
-
-                // Re-check on every app resume (when user switches back to app)
-                LaunchedEffect(resumeCounter) {
-                    if (resumeCounter > 0 && licenseChecked) {
-                        val ok = LicenseManager.heartbeat(applicationContext)
-                        if (!ok) {
-                            serverBlocked = true
-                            serverMessage = "License revoked"
-                        }
-                        // Also check for server message updates
-                        if (!serverBlocked) {
-                            val result = LicenseManager.verify(applicationContext)
-                            if (!result.valid && result.reason != "network_error") {
-                                serverBlocked = true
-                                serverMessage = result.message
-                            } else {
-                                serverMessage = result.message
-                            }
-                        }
-                    }
-                }
-
-                // Periodic heartbeat — every 5 minutes
-                LaunchedEffect(Unit) {
-                    while (true) {
-                        delay(5 * 60 * 1000L)
-                        val ok = LicenseManager.heartbeat(applicationContext)
-                        if (!ok) {
-                            serverBlocked = true
-                            serverMessage = "License expired"
-                        }
-                    }
                 }
 
                 val permState = hasPermission.value
